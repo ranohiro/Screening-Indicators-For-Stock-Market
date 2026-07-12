@@ -4,6 +4,7 @@ numpy>=1.24.0
 
 # 可視化・グラフ描画
 matplotlib>=3.7.0
+japanize-matplotlib
 
 # Jupyter Notebook 環境
 notebook>=7.0.0
