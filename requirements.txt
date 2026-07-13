@@ -18,3 +18,6 @@ streamlit>=1.30.0
 # データベース接続 (SQLite3は標準ライブラリに含まれるため不要)
 pandas-ta @ git+https://github.com/MerlinR/Pandas-ta-fork.git@main
 
+seaborn
+scikit-learn
+datetime
