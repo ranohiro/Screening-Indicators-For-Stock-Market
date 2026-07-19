@@ -38,6 +38,8 @@ def load_data():
     ORDER BY code, date
     """
     df_prices = pd.read_sql_query(query_prices, conn)
+    for col in ['open', 'high', 'low', 'close', 'volume']:
+        df_prices[col] = pd.to_numeric(df_prices[col], errors='coerce')
     df_prices['date'] = pd.to_datetime(df_prices['date'], format='%Y%m%d', errors='coerce')
     df_prices.set_index(['code', 'date'], inplace=True)
     df_prices.sort_index(inplace=True)
@@ -53,8 +55,12 @@ def load_data():
         with open(json_path, 'r', encoding='utf-8') as f:
             ticker_dict = json.load(f)
             # 各銘柄情報を平坦化してリストに格納
-            for code, info in ticker_dict.items():
-                row = {'code': str(code), 'industry': info.get('industry', 'Unknown')}
+            for info in ticker_dict:
+                code = info.get('code')
+                row = {
+                    'code': str(code) if code is not None else '',
+                    'industry': info.get('industry', 'Unknown')
+                }
 
                 # Core_Product_Techタグの抽出
                 tags = info.get('layered_tags', {}).get('Core_Product_Tech', [])
@@ -81,6 +87,16 @@ def create_features(df_prices, df_tickers):
     """特徴量を動的生成する（全データ保持状態で行う）"""
     print("  - 特徴量を動的生成しています...")
     df = df_prices.copy()
+
+    # インデックスをリセットして株価・出来高の欠損値を補完
+    df_reset = df.reset_index()
+    price_cols = ['open', 'high', 'low', 'close']
+    for col in price_cols:
+        if col in df_reset.columns:
+            df_reset[col] = df_reset.groupby('code')[col].ffill().bfill()
+    if 'volume' in df_reset.columns:
+        df_reset['volume'] = df_reset['volume'].fillna(0)
+    df = df_reset.set_index(['code', 'date'])
 
     # 銘柄ごとの処理
     grouped = df.groupby(level='code')
@@ -183,6 +199,10 @@ def construct_universe(df_features):
     # 銘柄ごとに bfill() （後ろ向き補完）を行う
     # これにより、GC期間中の各行に「その後に初めて来るDC日の日付と終値」が埋まる
     df_reset[['next_dc_date', 'next_dc_price']] = df_reset.groupby('code')[['next_dc_date', 'next_dc_price']].bfill()
+
+    # 型の再強制（bfillにより int64 などの予期せぬ型にキャストされるのを防ぐ）
+    df_reset['next_dc_date'] = pd.to_datetime(df_reset['next_dc_date'], errors='coerce')
+    df_reset['next_dc_price'] = pd.to_numeric(df_reset['next_dc_price'], errors='coerce')
 
     # GC開始日からの経過日数を計算
     # is_gc == False の場合は経過日数を 0 にリセットする工夫
