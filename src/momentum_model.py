@@ -14,8 +14,6 @@ warnings.filterwarnings('ignore')
 # データベース設定
 # srcから見た相対パスに修正
 DB_PATH = 'data/stock_data.db'
-CSV_PATH = 'data/exports/screening_all_v01.csv'
-JSON_PATH = 'data/ticker_dictionary.json'
 
 def load_data():
     """データベースから必要なデータを読み込む"""
@@ -26,8 +24,7 @@ def load_data():
 
     if not os.path.exists(db_path):
         print(f"警告: データベースファイルが見つかりません: {db_path}")
-        # ダミーデータ生成ロジックが必要な場合は後で追加
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame()
 
     conn = sqlite3.connect(db_path)
 
@@ -55,25 +52,39 @@ def load_data():
 
     conn.close()
 
-    # サマリーCSVの取得
-    csv_path = os.path.join(root_dir, CSV_PATH)
-    df_summary = pd.DataFrame()
-    if os.path.exists(csv_path):
-        try:
-            df_summary = pd.read_csv(csv_path)
-        except Exception as e:
-            print(f"警告: サマリーCSVの読み込みに失敗しました: {e}")
-
     print(f"  - daily_prices: {len(df_prices)}行")
     print(f"  - daily_trade_indicators: {len(df_indicators)}行")
 
-    return df_prices, df_indicators, df_summary
+    return df_prices, df_indicators
 
-def construct_universe(df_prices):
-    """GC期間を特定しユニバースを作成する"""
+def create_features(df_prices, df_indicators):
+    """特徴量を生成し結合する（全データ保持状態で行う）"""
+    print("  - 特徴量を生成・結合しています...")
+
+    # df_indicators との結合
+    df = df_prices.join(df_indicators, how='left', rsuffix='_ind')
+
+    # 欠損値の処理 (前方補完、それでも残れば0埋め)
+    # groupbyを使用するためリセットインデックス
+    df_reset = df.reset_index()
+
+    # codeごとに前方補完 (期間で絞り込む前に実行することでデータ汚染を防ぐ)
+    cols_to_fill = ['vwap_dev', 'vol_ratio', 'ma5_slope', 'ma25_slope', 'consecutive_candles']
+    for col in cols_to_fill:
+        if col in df_reset.columns:
+            df_reset[col] = df_reset.groupby('code')[col].ffill().fillna(0)
+
+    # インデックスを元に戻す
+    df = df_reset.set_index(['code', 'date'])
+
+    print(f"  - 特徴量結合後のサンプル数: {len(df)}行")
+    return df
+
+def construct_universe(df_features):
+    """GC期間を特定しユニバースを作成する (ベクトル化)"""
     print("  - 5MAと25MAを計算しています...")
     # 各銘柄ごとにMAを計算
-    df = df_prices.copy()
+    df = df_features.copy()
 
     # 銘柄ごとの処理を高速化するため groupby を使用
     grouped = df.groupby(level='code')
@@ -84,110 +95,48 @@ def construct_universe(df_prices):
     # GC判定 (5MA > 25MA)
     df['is_gc'] = df['ma5'] > df['ma25']
 
-    # GC/DCの切り替わりを特定
-    # is_gcが前の行と異なる場合 True となるフラグ
-    df['gc_changed'] = grouped['is_gc'].shift(1) != df['is_gc']
+    print("  - GC期間を抽出し、ターゲット変数を計算しています (ベクトル化)...")
 
-    # 新しいGC期間が始まった日 (GC開始)
-    df['gc_start'] = df['is_gc'] & df['gc_changed']
+    # --- 高速化（ベクトル化）ロジック ---
 
-    # DCになった日 (GC終了)
-    df['dc_start'] = (~df['is_gc']) & df['gc_changed']
+    # インデックスから日付を列に出しておく
+    df_reset = df.reset_index()
 
-    print("  - GC期間を抽出し、ターゲット変数を計算しています...")
+    # GCではない（~is_gc）行の `date` と `close` を抽出し、
+    # 新しいカラム `next_dc_date` と `next_dc_price` にセット。
+    # GCである行には NaN が入る。
+    df_reset['next_dc_date'] = np.where(~df_reset['is_gc'], df_reset['date'], pd.NaT)
+    df_reset['next_dc_price'] = np.where(~df_reset['is_gc'], df_reset['close'], np.nan)
 
-    # 各銘柄ごとにGC期間のIDを振る
-    # gc_startがTrueになるたびにcumsumでIDが増加
-    df['gc_period_id'] = grouped['gc_start'].cumsum()
+    # 銘柄ごとに bfill() （後ろ向き補完）を行う
+    # これにより、GC期間中の各行に「その後に初めて来るDC日の日付と終値」が埋まる
+    df_reset[['next_dc_date', 'next_dc_price']] = df_reset.groupby('code')[['next_dc_date', 'next_dc_price']].bfill()
 
-    # GC期間のデータのみ抽出 (is_gc == True)
-    # DCになった日も含める必要があるため、少し工夫が必要
-    # DCになった日の終値を取得するために、前方にシフトしたデータを使うアプローチ等があるが、
-    # シンプルに各GC期間IDごとに、その期間が終わった次の日(DC発生日)の終値を取得する
+    # is_gc が True の行だけを抽出し、ユニバースとする
+    df_universe = df_reset[df_reset['is_gc']].copy()
 
-    results = []
+    # DC日が補完されなかった（最後までGCのまま終わった）行は除外
+    df_universe = df_universe.dropna(subset=['next_dc_date', 'next_dc_price'])
 
-    for code, group in df.groupby(level='code'):
-        # グループ内のデータを日付順にソート (念のため)
-        group = group.sort_index(level='date')
+    # ターゲット変数の計算
+    # (DC日終値 - 当日終値) / 当日終値
+    df_universe['target_score'] = np.where(
+        df_universe['close'] > 0,
+        (df_universe['next_dc_price'] - df_universe['close']) / df_universe['close'],
+        0
+    )
 
-        # is_gcの列だけ取得
-        is_gc = group['is_gc'].values
-        closes = group['close'].values
-        dates = group.index.get_level_values('date')
+    # カラム名のリネーム（元の互換性のため）
+    df_universe.rename(columns={'next_dc_date': 'dc_date', 'next_dc_price': 'dc_price'}, inplace=True)
 
-        n = len(is_gc)
+    # 再びインデックスをセット
+    df_universe.set_index(['code', 'date'], inplace=True)
 
-        for i in range(n):
-            if is_gc[i]:
-                # GC期間中である
-                # この期間がいつ終わるか(最初の is_gc == False)を探す
-                dc_idx = -1
-                for j in range(i + 1, n):
-                    if not is_gc[j]:
-                        dc_idx = j
-                        break
-
-                if dc_idx != -1:
-                    # DC日が特定できた場合のみ有効なデータとする
-                    dc_price = closes[dc_idx]
-                    current_price = closes[i]
-
-                    # ターゲットスコア = (DC日終値 - 当日終値) / 当日終値
-                    target_score = (dc_price - current_price) / current_price if current_price > 0 else 0
-
-                    results.append({
-                        'code': code,
-                        'date': dates[i],
-                        'target_score': target_score,
-                        'dc_date': dates[dc_idx],
-                        'dc_price': dc_price
-                    })
-
-    df_universe = pd.DataFrame(results)
-    if not df_universe.empty:
-        df_universe.set_index(['code', 'date'], inplace=True)
-        # 元の株価データ等と結合
-        df_universe = df_universe.join(df_prices, how='left')
+    # ターゲット変数のクリッピング（外れ値対策）
+    df_universe['target_score'] = df_universe['target_score'].clip(lower=-0.5, upper=2.0)
 
     print(f"  - 抽出されたGC期間サンプル数: {len(df_universe)}行")
     return df_universe
-
-def create_features(df_universe, df_indicators):
-    """特徴量を生成し結合する"""
-    print("  - 特徴量を生成・結合しています...")
-
-    # 出来高ベースアップ指標の計算 (過去5日平均 / 過去20日平均)
-    # 元のdf_prices (df_universeに含まれるvolume列) を使って計算するが、
-    # 既に df_universe には gc期間のデータしかないため、全体での計算が難しい。
-    # ここでは簡易的に、df_universe内で rolling ではなく、あらかじめ計算してマージするか、
-    # indicators のデータを利用する。
-
-    # daily_trade_indicators に vol_ratio などの出来高特徴量が既にある前提
-    df = df_universe.copy()
-
-    # df_indicators との結合
-    # df_indicatorsもマルチインデックスなので、そのままjoinできる
-    df = df.join(df_indicators, how='left', rsuffix='_ind')
-
-    # 欠損値の処理 (前方補完、それでも残れば0埋め)
-    # groupbyを使用するためリセットインデックス
-    df_reset = df.reset_index()
-
-    # codeごとに前方補完
-    cols_to_fill = ['vwap_dev', 'vol_ratio', 'ma5_slope', 'ma25_slope', 'consecutive_candles']
-    for col in cols_to_fill:
-        if col in df_reset.columns:
-            df_reset[col] = df_reset.groupby('code')[col].ffill().fillna(0)
-
-    # インデックスを元に戻す
-    df = df_reset.set_index(['code', 'date'])
-
-    # ターゲット変数のクリッピング（外れ値対策）
-    df['target_score'] = df['target_score'].clip(lower=-0.5, upper=2.0)
-
-    print(f"  - 特徴量結合後のサンプル数: {len(df)}行")
-    return df
 
 def train_and_evaluate(df_model):
     """ウォークフォワード検証でモデルの学習と評価を行う"""
@@ -328,31 +277,27 @@ def main():
 
     # 1. データの読み込み
     print("ステップ1: データの読み込み...")
-    df_prices, df_indicators, df_summary = load_data()
+    df_prices, df_indicators = load_data()
 
     if df_prices.empty:
         print("データが空のため、処理を終了します。")
         return
 
-    # 2. ユニバース構築
-    print("ステップ2: ユニバースの構築...")
-    df_universe = construct_universe(df_prices)
+    # 2. 特徴量生成 (全データがある状態で行う)
+    print("ステップ2: 特徴量生成 (欠損値補完)...")
+    df_features_all = create_features(df_prices, df_indicators)
+
+    # 3. ユニバース構築
+    print("ステップ3: ユニバースの構築 (GC期間抽出とラベリング)...")
+    df_universe = construct_universe(df_features_all)
 
     if df_universe.empty:
         print("有効なユニバースデータがありません。処理を終了します。")
         return
 
-    # 3. 特徴量生成
-    print("ステップ3: 特徴量生成...")
-    df_features = create_features(df_universe, df_indicators)
-
-    if df_features.empty:
-        print("特徴量生成後のデータがありません。処理を終了します。")
-        return
-
     # 4 & 5. モデル学習と評価
     print("ステップ4&5: モデル学習と評価...")
-    train_and_evaluate(df_features)
+    train_and_evaluate(df_universe)
 
     print("完了しました。")
 
