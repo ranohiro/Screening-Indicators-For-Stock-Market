@@ -36,6 +36,8 @@ def load_data():
     ORDER BY code, date
     """
     df_prices = pd.read_sql_query(query_prices, conn)
+    for col in ['open', 'high', 'low', 'close', 'volume']:
+        df_prices[col] = pd.to_numeric(df_prices[col], errors='coerce')
     df_prices['date'] = pd.to_datetime(df_prices['date'], format='%Y%m%d', errors='coerce')
     df_prices.set_index(['code', 'date'], inplace=True)
     df_prices.sort_index(inplace=True)
@@ -109,6 +111,10 @@ def construct_universe(df_features):
     # 銘柄ごとに bfill() （後ろ向き補完）を行う
     # これにより、GC期間中の各行に「その後に初めて来るDC日の日付と終値」が埋まる
     df_reset[['next_dc_date', 'next_dc_price']] = df_reset.groupby('code')[['next_dc_date', 'next_dc_price']].bfill()
+
+    # 型の再強制（bfillにより int64 などの予期せぬ型にキャストされるのを防ぐ）
+    df_reset['next_dc_date'] = pd.to_datetime(df_reset['next_dc_date'], errors='coerce')
+    df_reset['next_dc_price'] = pd.to_numeric(df_reset['next_dc_price'], errors='coerce')
 
     # is_gc が True の行だけを抽出し、ユニバースとする
     df_universe = df_reset[df_reset['is_gc']].copy()
