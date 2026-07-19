@@ -8,6 +8,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.model_selection import TimeSeriesSplit
 import lightgbm as lgb
+import shap
 import warnings
 
 warnings.filterwarnings('ignore')
@@ -37,8 +38,6 @@ def load_data():
     ORDER BY code, date
     """
     df_prices = pd.read_sql_query(query_prices, conn)
-    for col in ['open', 'high', 'low', 'close', 'volume']:
-        df_prices[col] = pd.to_numeric(df_prices[col], errors='coerce')
     df_prices['date'] = pd.to_datetime(df_prices['date'], format='%Y%m%d', errors='coerce')
     df_prices.set_index(['code', 'date'], inplace=True)
     df_prices.sort_index(inplace=True)
@@ -54,12 +53,8 @@ def load_data():
         with open(json_path, 'r', encoding='utf-8') as f:
             ticker_dict = json.load(f)
             # 各銘柄情報を平坦化してリストに格納
-            for info in ticker_dict:
-                code = info.get('code')
-                row = {
-                    'code': str(code) if code is not None else '',
-                    'industry': info.get('industry', 'Unknown')
-                }
+            for code, info in ticker_dict.items():
+                row = {'code': str(code), 'industry': info.get('industry', 'Unknown')}
 
                 # Core_Product_Techタグの抽出
                 tags = info.get('layered_tags', {}).get('Core_Product_Tech', [])
@@ -87,31 +82,27 @@ def create_features(df_prices, df_tickers):
     print("  - 特徴量を動的生成しています...")
     df = df_prices.copy()
 
-    # インデックスをリセットして株価・出来高の欠損値を補完
-    df_reset = df.reset_index()
-    price_cols = ['open', 'high', 'low', 'close']
-    for col in price_cols:
-        if col in df_reset.columns:
-            df_reset[col] = df_reset.groupby('code')[col].ffill().bfill()
-    if 'volume' in df_reset.columns:
-        df_reset['volume'] = df_reset['volume'].fillna(0)
-    df = df_reset.set_index(['code', 'date'])
-
     # 銘柄ごとの処理
     grouped = df.groupby(level='code')
 
-    # MAの計算
-    ma5 = grouped['close'].rolling(window=5, min_periods=1).mean().reset_index(level=0, drop=True)
-    ma25 = grouped['close'].rolling(window=25, min_periods=1).mean().reset_index(level=0, drop=True)
+    # MAの計算 (transformを使用してMultiIndexを維持したまま計算)
+    ma5 = grouped['close'].transform(lambda x: x.rolling(window=5, min_periods=1).mean())
+    ma25 = grouped['close'].transform(lambda x: x.rolling(window=25, min_periods=1).mean())
 
     # 特徴量: ma5_slope, ma25_slope (前日比)
-    # 正しい計算方法: MA自身の値を銘柄ごとにシフトして変化率を計算
-    df['ma5_slope'] = ma5 / ma5.groupby(level='code').shift(1) - 1
-    df['ma25_slope'] = ma25 / ma25.groupby(level='code').shift(1) - 1
+    # dfに直接追加してからgroupbyでシフトする方が安全
+    df['ma5'] = ma5
+    df['ma25'] = ma25
+
+    df['ma5_slope'] = df['ma5'] / grouped['ma5'].shift(1) - 1
+    df['ma25_slope'] = df['ma25'] / grouped['ma25'].shift(1) - 1
+
+    # 計算用の一時カラムは削除
+    df.drop(columns=['ma5', 'ma25'], inplace=True)
 
     # 出来高の移動平均
-    vol_ma5 = grouped['volume'].rolling(window=5, min_periods=1).mean().reset_index(level=0, drop=True)
-    vol_ma20 = grouped['volume'].rolling(window=20, min_periods=1).mean().reset_index(level=0, drop=True)
+    vol_ma5 = grouped['volume'].transform(lambda x: x.rolling(window=5, min_periods=1).mean())
+    vol_ma20 = grouped['volume'].transform(lambda x: x.rolling(window=20, min_periods=1).mean())
 
     # 特徴量: vol_ratio, vol_ratio_5d
     # 0割りを防ぐため、分母に微小値を足す
@@ -140,7 +131,7 @@ def create_features(df_prices, df_tickers):
         print("  - テーマ別(Core_Product_Tech)のモメンタム特徴量を算出しています...")
         if 'core_product_tech' in df.columns:
             # 日付 x テーマ ごとの ma5_slope と vol_ratio の平均を計算
-            theme_grouped = df.groupby(['date', 'core_product_tech'])
+            theme_grouped = df.groupby(['date', 'core_product_tech'], observed=True)
             theme_avg = theme_grouped[['ma5_slope', 'vol_ratio']].mean().reset_index()
             theme_avg.rename(columns={
                 'ma5_slope': 'theme_ma5_slope_avg',
@@ -170,8 +161,8 @@ def construct_universe(df_features):
     # 銘柄ごとの処理を高速化するため groupby を使用
     grouped = df.groupby(level='code')
 
-    df['ma5'] = grouped['close'].rolling(window=5, min_periods=1).mean().reset_index(level=0, drop=True)
-    df['ma25'] = grouped['close'].rolling(window=25, min_periods=1).mean().reset_index(level=0, drop=True)
+    df['ma5'] = grouped['close'].transform(lambda x: x.rolling(window=5, min_periods=1).mean())
+    df['ma25'] = grouped['close'].transform(lambda x: x.rolling(window=25, min_periods=1).mean())
 
     # GC判定 (5MA > 25MA)
     df['is_gc'] = df['ma5'] > df['ma25']
@@ -192,10 +183,6 @@ def construct_universe(df_features):
     # 銘柄ごとに bfill() （後ろ向き補完）を行う
     # これにより、GC期間中の各行に「その後に初めて来るDC日の日付と終値」が埋まる
     df_reset[['next_dc_date', 'next_dc_price']] = df_reset.groupby('code')[['next_dc_date', 'next_dc_price']].bfill()
-
-    # 型の再強制（bfillにより int64 などの予期せぬ型にキャストされるのを防ぐ）
-    df_reset['next_dc_date'] = pd.to_datetime(df_reset['next_dc_date'], errors='coerce')
-    df_reset['next_dc_price'] = pd.to_numeric(df_reset['next_dc_price'], errors='coerce')
 
     # GC開始日からの経過日数を計算
     # is_gc == False の場合は経過日数を 0 にリセットする工夫
@@ -378,6 +365,35 @@ def train_and_evaluate(df_model):
         plot_path = os.path.join(export_dir, 'feature_importance.png')
         plt.savefig(plot_path)
         log_print(f"特徴量重要度のグラフを保存しました: {plot_path}")
+
+        # --- モデルの保存とSHAP値の出力（最後のFoldのモデルを使用） ---
+        if 'model' in locals() and 'X_test' in locals():
+            # モデルの保存
+            model_path = os.path.join(export_dir, 'momentum_model_baseline.txt')
+            model.booster_.save_model(model_path)
+            log_print(f"モデルを保存しました: {model_path}")
+
+            # SHAP値の計算と出力
+            log_print("テストデータに対するSHAP値を計算しています...")
+            try:
+                # TreeExplainer を使用
+                explainer = shap.TreeExplainer(model)
+                shap_values = explainer.shap_values(X_test)
+
+                # shap_values がリストの場合 (LightGBMの2値分類など)、クラス1のSHAP値を取得
+                if isinstance(shap_values, list):
+                    shap_values = shap_values[1]
+
+                # SHAP summary plot の作成と保存
+                plt.figure(figsize=(10, 6))
+                shap.summary_plot(shap_values, X_test, show=False)
+                shap_plot_path = os.path.join(export_dir, 'shap_summary_plot.png')
+                plt.savefig(shap_plot_path, bbox_inches='tight')
+                plt.close()
+                log_print(f"SHAP summary plotを保存しました: {shap_plot_path}")
+            except Exception as e:
+                log_print(f"SHAPの計算中にエラーが発生しました: {e}")
+
     else:
         log_print("評価可能なFoldがありませんでした。")
 
