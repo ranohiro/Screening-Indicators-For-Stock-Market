@@ -3,6 +3,7 @@ import json
 import pandas as pd
 import numpy as np
 import os
+import datetime
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.model_selection import TimeSeriesSplit
@@ -39,43 +40,40 @@ def load_data():
     df_prices.set_index(['code', 'date'], inplace=True)
     df_prices.sort_index(inplace=True)
 
-    # daily_trade_indicatorsの取得
-    query_indicators = """
-    SELECT code, date, vwap_dev, vol_ratio, ma5_slope, ma25_slope, consecutive_candles
-    FROM daily_trade_indicators
-    ORDER BY code, date
-    """
-    df_indicators = pd.read_sql_query(query_indicators, conn)
-    df_indicators['date'] = pd.to_datetime(df_indicators['date'], format='%Y%m%d', errors='coerce')
-    df_indicators.set_index(['code', 'date'], inplace=True)
-    df_indicators.sort_index(inplace=True)
-
     conn.close()
 
     print(f"  - daily_prices: {len(df_prices)}行")
-    print(f"  - daily_trade_indicators: {len(df_indicators)}行")
+    return df_prices
 
-    return df_prices, df_indicators
+def create_features(df_prices):
+    """特徴量を動的生成する（全データ保持状態で行う）"""
+    print("  - 特徴量を動的生成しています...")
+    df = df_prices.copy()
 
-def create_features(df_prices, df_indicators):
-    """特徴量を生成し結合する（全データ保持状態で行う）"""
-    print("  - 特徴量を生成・結合しています...")
+    # 銘柄ごとの処理
+    grouped = df.groupby(level='code')
 
-    # df_indicators との結合
-    df = df_prices.join(df_indicators, how='left', rsuffix='_ind')
+    # MAの計算
+    ma5 = grouped['close'].rolling(window=5, min_periods=1).mean().reset_index(level=0, drop=True)
+    ma25 = grouped['close'].rolling(window=25, min_periods=1).mean().reset_index(level=0, drop=True)
 
-    # 欠損値の処理 (前方補完、それでも残れば0埋め)
-    # groupbyを使用するためリセットインデックス
-    df_reset = df.reset_index()
+    # 特徴量: ma5_slope, ma25_slope (前日比)
+    # 正しい計算方法: MA自身の値を銘柄ごとにシフトして変化率を計算
+    df['ma5_slope'] = ma5 / ma5.groupby(level='code').shift(1) - 1
+    df['ma25_slope'] = ma25 / ma25.groupby(level='code').shift(1) - 1
 
-    # codeごとに前方補完 (期間で絞り込む前に実行することでデータ汚染を防ぐ)
-    cols_to_fill = ['vwap_dev', 'vol_ratio', 'ma5_slope', 'ma25_slope', 'consecutive_candles']
-    for col in cols_to_fill:
-        if col in df_reset.columns:
-            df_reset[col] = df_reset.groupby('code')[col].ffill().fillna(0)
+    # 出来高の移動平均
+    vol_ma5 = grouped['volume'].rolling(window=5, min_periods=1).mean().reset_index(level=0, drop=True)
+    vol_ma20 = grouped['volume'].rolling(window=20, min_periods=1).mean().reset_index(level=0, drop=True)
 
-    # インデックスを元に戻す
-    df = df_reset.set_index(['code', 'date'])
+    # 特徴量: vol_ratio, vol_ratio_5d
+    # 0割りを防ぐため、分母に微小値を足す
+    epsilon = 1e-9
+    df['vol_ratio'] = df['volume'] / (vol_ma20 + epsilon)
+    df['vol_ratio_5d'] = vol_ma5 / (vol_ma20 + epsilon)
+
+    # 初期期間など計算不能なNaNを除外する
+    df = df.dropna(subset=['ma5_slope', 'ma25_slope', 'vol_ratio', 'vol_ratio_5d'])
 
     print(f"  - 特徴量結合後のサンプル数: {len(df)}行")
     return df
@@ -142,27 +140,35 @@ def train_and_evaluate(df_model):
     """ウォークフォワード検証でモデルの学習と評価を行う"""
     print("  - モデルの学習と評価を開始します (ウォークフォワード検証)")
 
+    # タイムスタンプ付きの出力ディレクトリ作成
+    timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    output_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    export_dir = os.path.join(output_dir, 'data', 'exports', f"{timestamp}_momentum_model_outputs")
+    os.makedirs(export_dir, exist_ok=True)
+
+    log_file_path = os.path.join(export_dir, 'evaluation_log.txt')
+    def log_print(msg):
+        print(msg)
+        with open(log_file_path, 'a', encoding='utf-8') as f:
+            f.write(msg + '\n')
+
+    log_print(f"出力ディレクトリを作成しました: {export_dir}")
+
     # 特徴量リスト
     features = [
-        'vwap_dev', 'vol_ratio', 'ma5_slope', 'ma25_slope', 'consecutive_candles'
+        'ma5_slope', 'ma25_slope', 'vol_ratio', 'vol_ratio_5d'
     ]
-    target = 'target_score'
-
-    # 必要なカラムが存在するか確認し、欠損値を0埋め
-    for f in features:
-        if f not in df_model.columns:
-            print(f"警告: 特徴量 {f} が存在しません。0で埋めます。")
-            df_model[f] = 0
+    target_raw = 'target_score'
 
     # インデックスをリセットして日付順にソート
     df = df_model.reset_index().sort_values('date')
 
     # 十分なデータがない場合はスキップ
     if len(df) < 10:
-        print(f"データが少なすぎます ({len(df)}行)。学習をスキップします。")
+        log_print(f"データが少なすぎます ({len(df)}行)。学習をスキップします。")
         return
 
-    # TimeSeriesSplit の設定 (例えば3分割)
+    # TimeSeriesSplit の設定
     n_splits = min(3, len(df) // 2)
     if n_splits < 2:
         n_splits = 2
@@ -179,48 +185,52 @@ def train_and_evaluate(df_model):
         test_df = df.iloc[test_idx].copy()
 
         # --- データリーク防止処理 ---
-        # 学習データのうち、テスト期間の開始時点で「まだGC期間が終わっていない（DCを迎えていない）」
-        # サンプルは、未来の情報(DC日終値)を使っているためリークとなる。これを除外する。
         test_start_date = test_df['date'].min()
         valid_train_mask = train_df['dc_date'] < test_start_date
         train_df = train_df[valid_train_mask]
 
         if len(train_df) == 0:
-            print(f"Fold {fold}: 有効な学習データがありません。スキップします。")
+            log_print(f"Fold {fold}: 有効な学習データがありません。スキップします。")
             fold += 1
             continue
 
+        # --- 分類タスク用ラベリング ---
+        # 学習データの target_score 上位20%を 1 とする
+        train_threshold = train_df[target_raw].quantile(0.8)
+        train_df['is_top_20'] = (train_df[target_raw] >= train_threshold).astype(int)
+
+        # テストデータの target_score 上位20%を 1 とする (評価指標・検証用)
+        test_threshold = test_df[target_raw].quantile(0.8)
+        test_df['is_top_20'] = (test_df[target_raw] >= test_threshold).astype(int)
+
         X_train = train_df[features]
-        y_train = train_df[target]
+        y_train = train_df['is_top_20']
         X_test = test_df[features]
-        y_test = test_df[target]
+        y_test = test_df['is_top_20']
 
-        # ターゲット変数が大きいもの（初動）に重み付け
-        # 簡単な例: scoreが0より大きい場合、重みを増やす
-        sample_weight = np.where(y_train > 0, 1.0 + y_train * 2, 1.0)
-
-        # LightGBMモデルの定義
-        model = lgb.LGBMRegressor(
+        # LightGBM Classifier の定義
+        model = lgb.LGBMClassifier(
             n_estimators=100,
             learning_rate=0.05,
             random_state=42,
-            n_jobs=-1
+            n_jobs=-1,
+            class_weight='balanced'
         )
 
-        model.fit(X_train, y_train, sample_weight=sample_weight)
+        model.fit(X_train, y_train)
 
-        # 予測
-        preds = model.predict(X_test)
-        test_df['pred_score'] = preds
+        # 予測確率の取得 (クラス '1' の確率)
+        preds_proba = model.predict_proba(X_test)[:, 1]
+        test_df['pred_proba'] = preds_proba
 
-        # 評価: 予測スコアの上位20%を「選択銘柄」とする
-        threshold = test_df['pred_score'].quantile(0.8)
-        selected_df = test_df[test_df['pred_score'] >= threshold]
+        # 評価: 予測確率の上位20%の銘柄群を抽出
+        pred_threshold = test_df['pred_proba'].quantile(0.8)
+        selected_df = test_df[test_df['pred_proba'] >= pred_threshold]
 
         # ベースラインリターン (テスト期間の全サンプルの平均ターゲットスコア = ランダム選択)
-        baseline_return = test_df['target_score'].mean()
-        # モデルリターン (選択銘柄の平均ターゲットスコア)
-        model_return = selected_df['target_score'].mean() if not selected_df.empty else 0
+        baseline_return = test_df[target_raw].mean()
+        # モデルリターン (選択銘柄群の平均ターゲットスコア)
+        model_return = selected_df[target_raw].mean() if not selected_df.empty else 0
 
         baseline_returns.append(baseline_return)
         model_returns.append(model_return)
@@ -233,59 +243,55 @@ def train_and_evaluate(df_model):
         })
         feature_importances.append(importance)
 
-        print(f"Fold {fold}: Train={len(train_df)}行, Test={len(test_df)}行 | "
-              f"Baseline Return: {baseline_return:.4f}, Model Return: {model_return:.4f}")
+        log_print(f"Fold {fold}:")
+        log_print(f"  - Train={len(train_df)}行, Top20_Threshold={train_threshold:.4f}, PositiveRate={y_train.mean():.2%}")
+        log_print(f"  - Test={len(test_df)}行, Top20_Threshold={test_threshold:.4f}")
+        log_print(f"  - 選択された銘柄数={len(selected_df)}行")
+        log_print(f"  - Baseline Return: {baseline_return:.4f}, Model Return: {model_return:.4f}")
         fold += 1
 
     # --- 結果の集計と出力 ---
     if feature_importances:
-        # 平均リターンの比較
         avg_baseline = np.mean(baseline_returns)
         avg_model = np.mean(model_returns)
-        print("-" * 50)
-        print(f"【評価結果】")
-        print(f"ランダム選択リターン (Baseline): {avg_baseline:.4f}")
-        print(f"モデル選択リターン (Model)   : {avg_model:.4f}")
-        print(f"優位性 (Model - Baseline)  : {avg_model - avg_baseline:.4f}")
+        log_print("-" * 50)
+        log_print(f"【最終評価結果】")
+        log_print(f"ランダム選択リターン (Baseline): {avg_baseline:.4f}")
+        log_print(f"モデル選択リターン (Model)   : {avg_model:.4f}")
+        log_print(f"優位性 (Model - Baseline)  : {avg_model - avg_baseline:.4f}")
 
-        # 特徴量重要度の集計
         df_imp = pd.concat(feature_importances)
         avg_imp = df_imp.groupby('feature')['importance'].mean().sort_values(ascending=False).reset_index()
 
-        print("-" * 50)
-        print("【特徴量重要度 (Feature Importance)】")
+        log_print("-" * 50)
+        log_print("【特徴量重要度 (Feature Importance)】")
         for i, row in avg_imp.iterrows():
-            print(f"{i+1}. {row['feature']}: {row['importance']:.2f}")
-
-        # グラフとして保存
-        output_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        export_dir = os.path.join(output_dir, 'data', 'exports')
-        os.makedirs(export_dir, exist_ok=True)
+            log_print(f"{i+1}. {row['feature']}: {row['importance']:.2f}")
 
         plt.figure(figsize=(10, 6))
         sns.barplot(x='importance', y='feature', data=avg_imp)
-        plt.title('Feature Importance (LightGBM)')
+        plt.title('Feature Importance (LightGBM Classifier)')
         plt.tight_layout()
         plot_path = os.path.join(export_dir, 'feature_importance.png')
         plt.savefig(plot_path)
-        print(f"特徴量重要度のグラフを保存しました: {plot_path}")
+        log_print(f"特徴量重要度のグラフを保存しました: {plot_path}")
     else:
-        print("評価可能なFoldがありませんでした。")
+        log_print("評価可能なFoldがありませんでした。")
 
 def main():
     print("モメンタム投資戦略ベースラインモデルの構築を開始します...")
 
     # 1. データの読み込み
     print("ステップ1: データの読み込み...")
-    df_prices, df_indicators = load_data()
+    df_prices = load_data()
 
     if df_prices.empty:
         print("データが空のため、処理を終了します。")
         return
 
     # 2. 特徴量生成 (全データがある状態で行う)
-    print("ステップ2: 特徴量生成 (欠損値補完)...")
-    df_features_all = create_features(df_prices, df_indicators)
+    print("ステップ2: 特徴量の動的生成...")
+    df_features_all = create_features(df_prices)
 
     # 3. ユニバース構築
     print("ステップ3: ユニバースの構築 (GC期間抽出とラベリング)...")
