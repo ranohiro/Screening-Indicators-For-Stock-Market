@@ -12,9 +12,10 @@ import warnings
 
 warnings.filterwarnings('ignore')
 
-# データベース設定
+# データベース・ファイル設定
 # srcから見た相対パスに修正
 DB_PATH = 'data/stock_data.db'
+JSON_PATH = 'data/ticker_dictionary.json'
 
 def load_data():
     """データベースから必要なデータを読み込む"""
@@ -36,18 +37,46 @@ def load_data():
     ORDER BY code, date
     """
     df_prices = pd.read_sql_query(query_prices, conn)
-    for col in ['open', 'high', 'low', 'close', 'volume']:
-        df_prices[col] = pd.to_numeric(df_prices[col], errors='coerce')
     df_prices['date'] = pd.to_datetime(df_prices['date'], format='%Y%m%d', errors='coerce')
     df_prices.set_index(['code', 'date'], inplace=True)
     df_prices.sort_index(inplace=True)
 
     conn.close()
 
-    print(f"  - daily_prices: {len(df_prices)}行")
-    return df_prices
+    # ticker_dictionary.json の読み込み
+    root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    json_path = os.path.join(root_dir, JSON_PATH)
 
-def create_features(df_prices):
+    ticker_info = []
+    if os.path.exists(json_path):
+        with open(json_path, 'r', encoding='utf-8') as f:
+            ticker_dict = json.load(f)
+            # 各銘柄情報を平坦化してリストに格納
+            for code, info in ticker_dict.items():
+                row = {'code': str(code), 'industry': info.get('industry', 'Unknown')}
+
+                # Core_Product_Techタグの抽出
+                tags = info.get('layered_tags', {}).get('Core_Product_Tech', [])
+                if isinstance(tags, list) and len(tags) > 0:
+                    row['core_product_tech'] = tags[0] # 簡易的に最初のタグを使用
+                else:
+                    row['core_product_tech'] = 'Unknown'
+
+                ticker_info.append(row)
+    else:
+        print(f"警告: 銘柄辞書ファイルが見つかりません: {json_path}")
+
+    df_tickers = pd.DataFrame(ticker_info)
+    if not df_tickers.empty:
+        df_tickers['industry'] = df_tickers['industry'].astype('category')
+        df_tickers['core_product_tech'] = df_tickers['core_product_tech'].astype('category')
+
+    print(f"  - daily_prices: {len(df_prices)}行")
+    print(f"  - ticker_info: {len(df_tickers)}行")
+
+    return df_prices, df_tickers
+
+def create_features(df_prices, df_tickers):
     """特徴量を動的生成する（全データ保持状態で行う）"""
     print("  - 特徴量を動的生成しています...")
     df = df_prices.copy()
@@ -74,8 +103,44 @@ def create_features(df_prices):
     df['vol_ratio'] = df['volume'] / (vol_ma20 + epsilon)
     df['vol_ratio_5d'] = vol_ma5 / (vol_ma20 + epsilon)
 
+    # df_tickers の結合 (industry, core_product_tech等)
+    if not df_tickers.empty:
+        # code列を軸に結合するためにインデックスをリセット
+        df = df.reset_index()
+        df = pd.merge(df, df_tickers, on='code', how='left')
+
+        # 欠損したカテゴリカル変数を 'Unknown' にする
+        if 'industry' in df.columns:
+            if 'Unknown' not in df['industry'].cat.categories:
+                df['industry'] = df['industry'].cat.add_categories('Unknown')
+            df['industry'] = df['industry'].fillna('Unknown')
+
+        if 'core_product_tech' in df.columns:
+            if 'Unknown' not in df['core_product_tech'].cat.categories:
+                df['core_product_tech'] = df['core_product_tech'].cat.add_categories('Unknown')
+            df['core_product_tech'] = df['core_product_tech'].fillna('Unknown')
+
+        # テーマ（地合い）特徴量の動的算出
+        print("  - テーマ別(Core_Product_Tech)のモメンタム特徴量を算出しています...")
+        if 'core_product_tech' in df.columns:
+            # 日付 x テーマ ごとの ma5_slope と vol_ratio の平均を計算
+            theme_grouped = df.groupby(['date', 'core_product_tech'])
+            theme_avg = theme_grouped[['ma5_slope', 'vol_ratio']].mean().reset_index()
+            theme_avg.rename(columns={
+                'ma5_slope': 'theme_ma5_slope_avg',
+                'vol_ratio': 'theme_vol_ratio_avg'
+            }, inplace=True)
+
+            # 元のデータフレームにマージ
+            df = pd.merge(df, theme_avg, on=['date', 'core_product_tech'], how='left')
+
+        df = df.set_index(['code', 'date'])
+
     # 初期期間など計算不能なNaNを除外する
-    df = df.dropna(subset=['ma5_slope', 'ma25_slope', 'vol_ratio', 'vol_ratio_5d'])
+    subset_cols = ['ma5_slope', 'ma25_slope', 'vol_ratio', 'vol_ratio_5d']
+    if 'theme_ma5_slope_avg' in df.columns:
+        subset_cols.extend(['theme_ma5_slope_avg', 'theme_vol_ratio_avg'])
+    df = df.dropna(subset=subset_cols)
 
     print(f"  - 特徴量結合後のサンプル数: {len(df)}行")
     return df
@@ -112,9 +177,14 @@ def construct_universe(df_features):
     # これにより、GC期間中の各行に「その後に初めて来るDC日の日付と終値」が埋まる
     df_reset[['next_dc_date', 'next_dc_price']] = df_reset.groupby('code')[['next_dc_date', 'next_dc_price']].bfill()
 
-    # 型の再強制（bfillにより int64 などの予期せぬ型にキャストされるのを防ぐ）
-    df_reset['next_dc_date'] = pd.to_datetime(df_reset['next_dc_date'], errors='coerce')
-    df_reset['next_dc_price'] = pd.to_numeric(df_reset['next_dc_price'], errors='coerce')
+    # GC開始日からの経過日数を計算
+    # is_gc == False の場合は経過日数を 0 にリセットする工夫
+    # is_gc の True が連続する長さを測る
+    is_gc_int = df_reset['is_gc'].astype(int)
+    # GCではない行をブロックの境界としてcumsumし、ブロックごとのIDを作る
+    df_reset['gc_block'] = (~df_reset['is_gc']).groupby(df_reset['code']).cumsum()
+    # ブロック内で is_gc_int の cumsum をとると、GC期間中のみカウントアップされる
+    df_reset['days_since_gc'] = df_reset.groupby(['code', 'gc_block'])['is_gc'].cumsum()
 
     # is_gc が True の行だけを抽出し、ユニバースとする
     df_universe = df_reset[df_reset['is_gc']].copy()
@@ -162,8 +232,15 @@ def train_and_evaluate(df_model):
 
     # 特徴量リスト
     features = [
-        'ma5_slope', 'ma25_slope', 'vol_ratio', 'vol_ratio_5d'
+        'ma5_slope', 'ma25_slope', 'vol_ratio', 'vol_ratio_5d', 'days_since_gc'
     ]
+
+    if 'theme_ma5_slope_avg' in df_model.columns:
+        features.extend(['theme_ma5_slope_avg', 'theme_vol_ratio_avg'])
+
+    if 'industry' in df_model.columns:
+        features.append('industry')
+
     target_raw = 'target_score'
 
     # インデックスをリセットして日付順にソート
@@ -289,7 +366,7 @@ def main():
 
     # 1. データの読み込み
     print("ステップ1: データの読み込み...")
-    df_prices = load_data()
+    df_prices, df_tickers = load_data()
 
     if df_prices.empty:
         print("データが空のため、処理を終了します。")
@@ -297,7 +374,7 @@ def main():
 
     # 2. 特徴量生成 (全データがある状態で行う)
     print("ステップ2: 特徴量の動的生成...")
-    df_features_all = create_features(df_prices)
+    df_features_all = create_features(df_prices, df_tickers)
 
     # 3. ユニバース構築
     print("ステップ3: ユニバースの構築 (GC期間抽出とラベリング)...")
