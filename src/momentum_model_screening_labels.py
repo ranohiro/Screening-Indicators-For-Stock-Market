@@ -20,7 +20,8 @@ JSON_PATH = 'data/ticker_dictionary.json'
 SCREENING_CSV_PATH = 'data/exports/screening_all_v01.csv'
 
 # ラベリング設定: 1大相場エピソード内の上位何%を正例とするか
-TOP_PERCENTILE = 0.30  # 上位30%を正例(1)、下位70%を負例(0)
+TOP_PERCENTILE = 0.35  # 上位35%を正例(1)、下位65%を負例(0)
+# ※ グリッドサーチ(10%〜50%)の結果、ROC-AUCが最大(0.8996)となる35%を採用（2026-07-20）
 
 def load_data():
     """データベース・JSONファイル・スクリーニングCSVからデータを読み込む"""
